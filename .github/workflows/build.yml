@@ -1,0 +1,182 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  no-firmware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: No firmware, disk images or settings in the repository
+        run: |
+          bad=$(git ls-files | grep -iE '(^|/)emu_darwin_v[^/]*\.zip$|\.(img|hda|bin|ini)$|(^|/)Firmware/' || true)
+          if [ -n "$bad" ]; then echo "Must not be in the repository:"; echo "$bad"; exit 1; fi
+          echo "none found"
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libsdl2-dev libasound2-dev xvfb
+      - name: Version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="dev-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - run: make -C darwin -j4 VERSION="$VERSION"
+      # Starts the program on a virtual display, draws the panel and the settings pages, exits.
+      - name: Smoke test
+        timeout-minutes: 2
+        env:
+          SDL_AUDIODRIVER: dummy
+        run: |
+          mkdir -p build
+          xvfb-run -a darwin/Emu_Darwin -smoke build/shot-linux.bmp
+          xvfb-run -a darwin/Emu_Darwin -dlgshot build/shot-linux-settings
+          test -s build/shot-linux.bmp && test -s build/shot-linux-settings0.bmp
+      - name: Package
+        run: bash scripts/package.sh linux "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-linux
+          path: dist/*
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-linux
+          path: build/shot-*.bmp
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            zip
+            curl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-SDL2
+      - name: Version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="dev-${GITHUB_SHA::7}"; fi
+          echo "$v" > version.txt
+      - run: make -C darwin -j4 VERSION="$(cat version.txt)"
+      - name: Smoke test
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          $p = Start-Process -PassThru -Wait darwin/Emu_Darwin.exe -ArgumentList '-smoke build/shot-windows.bmp'
+          if ($p.ExitCode -ne 0 -or -not (Test-Path build/shot-windows.bmp)) { throw "the program did not start (exit $($p.ExitCode))" }
+          $p = Start-Process -PassThru -Wait darwin/Emu_Darwin.exe -ArgumentList '-dlgshot build/shot-windows-settings'
+          if (-not (Test-Path build/shot-windows-settings0.bmp)) { throw "the settings window did not draw" }
+      - name: Package
+        run: bash scripts/package.sh windows "$(cat version.txt)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows
+          path: dist/*
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-windows
+          path: build/shot-*.bmp
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      SDL_VERSION: 2.32.10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="dev-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Build static SDL2
+        run: |
+          curl -fsSL -o sdl.tar.gz \
+            "https://github.com/libsdl-org/SDL/releases/download/release-${SDL_VERSION}/SDL2-${SDL_VERSION}.tar.gz"
+          tar -xzf sdl.tar.gz
+          cmake -S "SDL2-${SDL_VERSION}" -B sdl-build -DCMAKE_BUILD_TYPE=Release \
+                -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build sdl-build --parallel
+          cmake --install sdl-build --prefix "$PWD/sdl"
+      - name: Build
+        run: |
+          SDL_LIBS="$(sdl/bin/sdl2-config --static-libs)"
+          echo "SDL_LIBS=$SDL_LIBS"
+          if [ -z "$SDL_LIBS" ]; then echo "sdl2-config returned no flags"; exit 1; fi
+          make -C darwin -j4 VERSION="$VERSION" \
+               CC="clang -arch arm64 -arch x86_64 -mmacosx-version-min=11.0" \
+               SDL_CONFIG="$PWD/sdl/bin/sdl2-config" SDL_LIBS="$SDL_LIBS"
+          lipo -info darwin/Emu_Darwin
+      - name: Package
+        run: bash scripts/package.sh macos "$VERSION"
+      - name: Check the program needs only system libraries
+        run: |
+          mkdir -p check && ditto -x -k dist/*.zip check
+          bin=$(echo check/*/Emu_Darwin.app/Contents/MacOS/Emu_Darwin)
+          otool -L "$bin"
+          if otool -L "$bin" | grep -E '^[[:space:]]' | grep -vE '^[[:space:]]*(/System/Library/|/usr/lib/)'; then
+            echo "the program depends on a library outside macOS"; exit 1
+          fi
+      - name: Smoke test
+        timeout-minutes: 2
+        run: |
+          mkdir -p build
+          bin=$(echo check/*/Emu_Darwin.app/Contents/MacOS/Emu_Darwin)
+          "$bin" -smoke build/shot-macos.bmp
+          "$bin" -dlgshot build/shot-macos-settings
+          test -s build/shot-macos.bmp && test -s build/shot-macos-settings0.bmp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-macos
+          path: dist/*
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-macos
+          path: build/shot-*.bmp
+
+  release:
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [no-firmware, linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to create the release
+    steps:
+      - uses: actions/checkout@v4   # for release/NOTES.md
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: release/NOTES.md
+          generate_release_notes: true

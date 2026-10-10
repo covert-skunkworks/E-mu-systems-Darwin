@@ -1,0 +1,3 @@
+[submodule "darwin/third_party/nuklear"]
+	path = darwin/third_party/nuklear
+	url = https://github.com/Immediate-Mode-UI/Nuklear.git

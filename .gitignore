@@ -1,0 +1,15 @@
+build/
+dist/
+darwin/build/
+darwin/build-*/
+darwin/Emu_Darwin.exe
+darwin/Emu_Darwin
+*.o
+
+darwin/darwin_nvram*.bin
+darwin/Emu_Darwin.ini
+darwin/Emu_Darwin.log
+*.img
+*.pgm
+*.bmp
+
